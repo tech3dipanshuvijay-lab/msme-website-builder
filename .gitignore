@@ -2,6 +2,10 @@
 udyam/
 *.pdf
 
+# Local SQLite databases
+*.db
+*.sqlite3
+
 # Temporary test scripts & scratch files
 scratch/
 
