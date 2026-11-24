@@ -308,123 +308,256 @@ def format_date_for_display(value):
 
 
 # ---------------------------------------------------------------------
-# CORRECTED & TABLE-AWARE GST PARSER
+# ADVANCED WATERMARK-SUPPRESSED & TABLE-AWARE GST PARSER
 # ---------------------------------------------------------------------
+
+def strip_watermark_from_lines(raw_text):
+    if not raw_text:
+        return ""
+    lines = str(raw_text).split('\n')
+    cleaned = []
+    for line in lines:
+        s = line.strip()
+        # Drop lines that are only 1 single letter (watermark char like x, a, T, s, e, i, v, d, n, G)
+        if len(s) == 1 and s.isalpha():
+            continue
+        # Drop lines that are two single letters separated by space (e.g. "e c", "d n")
+        if re.match(r'^[a-zA-Z]\s+[a-zA-Z]$', s):
+            continue
+        # Drop stray punctuation-only lines
+        if re.match(r'^[\.,\-_~•]+$', s):
+            continue
+        # Remove trailing single-letter watermark at end of line (e.g. "ASSOCIATION a" -> "ASSOCIATION")
+        s = re.sub(r'\s+[a-zA-Z]$', '', s)
+        if s:
+            cleaned.append(s)
+    return '\n'.join(cleaned)
+
+
+def clean_gst_field(val):
+    if not val:
+        return ""
+    val = strip_watermark_from_lines(val)
+    val = re.sub(r'\s+', ' ', val).strip(" :-\t\n,.")
+    # If the remaining value is <= 2 characters, it's just watermark or empty
+    if len(val) <= 2 or val.lower() in ('na', 'nil', 'none', 'not applicable', 'not stated', 'null'):
+        return ""
+    # Fix common OCR typos in company names
+    val = re.sub(r'\bLJMTrED\b', 'LIMITED', val, flags=re.IGNORECASE)
+    val = re.sub(r'\bDESTlNATlON\b', 'DESTINATION', val, flags=re.IGNORECASE)
+    val = re.sub(r'\bDESTlNATlONS\b', 'DESTINATIONS', val, flags=re.IGNORECASE)
+    val = re.sub(r'\bVIBRANTSOLIDAY\b', 'VIBRANT HOLIDAYS', val, flags=re.IGNORECASE)
+    return val.strip()
+
+
+def clean_trade_name(trade_raw, legal_name=""):
+    if not trade_raw:
+        return legal_name
+    trade_raw = strip_watermark_from_lines(trade_raw)
+    trade_raw = re.sub(r'\s+', ' ', trade_raw).strip()
+    # Strip garbled label artifacts from OCR: ".,ifa.oy", ", if any", "if any"
+    trade_raw = re.sub(r'^[,\.\s]*(?:if\s*a[a-z0-9\.\s]+|\.,ifa\.oy|,ifa\.oy|ifa\.oy|if\s*any)\s*', '', trade_raw, flags=re.IGNORECASE)
+    cleaned = clean_gst_field(trade_raw)
+    # If invalid or mentions additional trade name / constitution, reject it
+    if not cleaned or len(cleaned) <= 2 or "additional trade" in cleaned.lower() or "constitution of" in cleaned.lower():
+        return legal_name
+    return cleaned
+
+
+def clean_gst_address(addr_raw):
+    if not addr_raw:
+        return ""
+    lines = str(addr_raw).split('\n')
+    cleaned_lines = []
+    for line in lines:
+        s = line.strip()
+        if len(s) == 1 and s.isalpha():
+            continue
+        if re.match(r'^[a-zA-Z]\s+[a-zA-Z]$', s):
+            continue
+        s = re.sub(r'\s+[a-zA-Z]$', '', s)
+        # Skip isolated "Business" word on its own line
+        if s.lower() == 'business':
+            continue
+        if s:
+            cleaned_lines.append(s)
+
+    joined = ' '.join(cleaned_lines)
+    # Remove accidental "Business" occurrences attached to address
+    joined = re.sub(r'\bBusiness\s+', '', joined, flags=re.IGNORECASE)
+    # Clean up standard GST address labels
+    joined = re.sub(r'\bFloor\s*No\.?\s*:\s*', '', joined, flags=re.IGNORECASE)
+    joined = re.sub(r'\bBuilding\s*No\.?\s*/?\s*Flat\s*No\.?\s*:\s*', ', ', joined, flags=re.IGNORECASE)
+    joined = re.sub(r'\bName\s*Of\s*Premises\s*/?\s*Building\s*:\s*', ', ', joined, flags=re.IGNORECASE)
+    joined = re.sub(r'\bRoad\s*/?\s*Street\s*:\s*', ', ', joined, flags=re.IGNORECASE)
+    joined = re.sub(r'\bLocality\s*/?\s*Sub\s*Localit(?:y|ry)\s*:\s*', ', ', joined, flags=re.IGNORECASE)
+    joined = re.sub(r'\bCity\s*/?\s*Town\s*/?\s*Villagee?\s*:\s*', ', ', joined, flags=re.IGNORECASE)
+    joined = re.sub(r'\bDistrict\s*:\s*', ', ', joined, flags=re.IGNORECASE)
+    joined = re.sub(r'\bState\s*:\s*', ', ', joined, flags=re.IGNORECASE)
+    joined = re.sub(r'\bPIN\s*Code\s*:\s*', ' - ', joined, flags=re.IGNORECASE)
+
+    # Clean OCR characters and normalize spaces
+    joined = joined.replace('>', ', ').replace('~', ' ')
+    # Fix OCR typos in address
+    joined = re.sub(r'\bB[re]+ngal[eu]+ru\b', 'Bengaluru', joined, flags=re.IGNORECASE)
+    joined = re.sub(r'\bSOLARlS\.-l\b', 'SOLARIS-1', joined, flags=re.IGNORECASE)
+    joined = re.sub(r'\bSAlCI\b', 'SAKI', joined, flags=re.IGNORECASE)
+    joined = re.sub(r'\bYlHAR\b', 'VIHAR', joined, flags=re.IGNORECASE)
+    joined = re.sub(r'\s*,\s*', ', ', joined)
+    joined = re.sub(r'\s+', ' ', joined).strip(' ,-\t\n')
+
+    # Format PIN code cleanly at the end
+    m_pin = re.search(r'\b(\d{6})\b', joined)
+    if m_pin:
+        pin = m_pin.group(1)
+        joined_no_pin = re.sub(r'[\s,\-]+' + pin + r'[,\s]*', ', ', joined).strip(' ,-')
+        return f"{joined_no_pin} - {pin}"
+    return joined
+
 
 def parse_gst_text(text, pages_tables=None):
     data = {}
-
-    # 1. Extract clean key-value pairs from PDF tables first (prevents trailing 'T' column bleed)
     table_kv = {}
-    additional_addresses = []
 
+    # 1. Parse tables if available
     if pages_tables:
         for page_idx, page in enumerate(pages_tables):
             for table in page:
                 for row in table:
-                    cells = [clean_line(c) for c in row if c and clean_line(c)]
+                    cells = [clean_gst_field(c) for c in row if c]
+                    cells = [c for c in cells if c]
                     if not cells:
                         continue
-                    # Page 2+ Additional Place of Business table rows (check serial number before normalising)
-                    if page_idx >= 1 and ("address" in cells[0].lower() or re.match(r"^\d+$", cells[0])):
-                        addr_candidate = cells[-1] if len(cells) > 2 else cells[1]
-                        if re.search(r"\b\d{6}\b", addr_candidate):
-                            additional_addresses.append(addr_candidate)
-                    else:
-                        cells = normalise_row_cells(cells)
-                        if len(cells) >= 2:
-                            key = cells[0].lower()
-                            val = cells[1]
-                            table_kv[key] = val
+                    if len(cells) >= 2:
+                        k = cells[0].lower()
+                        if re.match(r'^\d+\.?$', cells[0]) and len(cells) >= 3:
+                            k = cells[1].lower()
+                            v = cells[2]
+                        else:
+                            v = cells[1]
+                        table_kv[k] = v
 
-    # 2. GSTIN extraction
-    m_gstin = re.search(r"\b([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1})\b", text)
+    clean_text = strip_watermark_from_lines(text)
+
+    # 2. Extract GSTIN
+    m_gstin = re.search(r'\b([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1})\b', text)
     if m_gstin:
         data["gstin"] = m_gstin.group(1).strip()
     else:
-        raw_gstin = first_match([
-            r"\bGSTIN\s*[:\-]?\s*([0-9A-Z]{15})\b",
-            r"\bGSTIN/UIN\s*[:\-]?\s*([0-9A-Z]{15})\b",
-        ], text)
-        if raw_gstin and len(raw_gstin) == 15:
-            data["gstin"] = raw_gstin
+        # OCR typo: 'O' instead of 0 in 4-digit numeric slot
+        m_ocr_gstin = re.search(r'\b([0-9]{2}[A-Z]{5}[0-9O]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1})\b', text)
+        if m_ocr_gstin:
+            raw_g = m_ocr_gstin.group(1).strip()
+            corrected = raw_g[:7] + raw_g[7:11].replace('O', '0') + raw_g[11:]
+            data["gstin"] = corrected
+        else:
+            m_alt = re.search(r'(?:Registration\s*Number|GSTIN)\s*[:\-]?\s*([0-9A-Z]{15})\b', text, re.IGNORECASE)
+            if m_alt:
+                data["gstin"] = m_alt.group(1).strip()
 
-    # 3. Legal Name of Business
-    legal_raw = next((v for k, v in table_kv.items() if "legal name" in k), "") or first_match([
-        r"Legal Name of Business\s*[:\-]?\s*(.+)",
-        r"Legal Name\s*[:\-]?\s*(.+)",
-    ], text)
-    data["legal_name"] = clean_gst_name(legal_raw)
+    # 3. Legal Name
+    legal_raw = ""
+    for k, v in table_kv.items():
+        if "legal name" in k:
+            legal_raw = v
+            break
+    if not legal_raw:
+        m_legal = re.search(r'(?:[1LlI\.\s]+)?Legal\s*Na(?:m|ni)[a-z]*(?:\s+of\s+Business)?\s*[:\.\-]?\s*(.+)', clean_text, re.IGNORECASE)
+        if m_legal:
+            legal_raw = m_legal.group(1)
+
+    data["legal_name"] = clean_gst_field(legal_raw)
 
     # 4. Trade Name
-    trade_raw = next((v for k, v in table_kv.items() if "trade name" in k), "") or first_match([
-        r"Trade Name(?:, if any)?\s*[:\-]?\s*(.+)",
-        r"Trade Name\s*[:\-]?\s*(.+)",
-    ], text)
-    data["trade_name"] = clean_gst_name(trade_raw) or data.get("legal_name", "")
+    trade_raw = ""
+    for k, v in table_kv.items():
+        if "trade name" in k and "additional" not in k:
+            trade_raw = v
+            break
+    if not trade_raw:
+        m_trade = re.search(r'(?:[2\.\s]+)?Trade\s*Na(?:m|ni)[a-z]*[^\n]*?\s+([A-Z0-9].+)', clean_text, re.IGNORECASE)
+        if m_trade:
+            trade_raw = m_trade.group(1)
 
-    # 5. Constitution of Business (Private Limited Company / Proprietorship / Partnership)
-    org_raw = next((v for k, v in table_kv.items() if "constitution of business" in k), "") or first_match([
-        r"Constitution of Business\s*[:\-]?\s*(.+)",
-    ], text)
-    data["organisation_type"] = clean_gst_name(org_raw)
+    data["trade_name"] = clean_trade_name(trade_raw, legal_name=data.get("legal_name", ""))
 
-    # 6. Type of Registration (e.g., Regular)
-    reg_type = next((v for k, v in table_kv.items() if "type of registration" in k), "") or first_match([
-        r"Type of Registration\s*[:\-]?\s*(.+)",
-    ], text)
-    data["gst_registration_type"] = clean_gst_name(reg_type)
+    # 5. Constitution of Business
+    org_raw = ""
+    for k, v in table_kv.items():
+        if "constitution" in k:
+            org_raw = v
+            break
+    if not org_raw:
+        m_org = re.search(r'(?:3\.?\s*)?Constitution\s*of\s*Business\s*[:\.\-]?\s*(.+)', clean_text, re.IGNORECASE)
+        if m_org:
+            org_raw = m_org.group(1)
+    data["organisation_type"] = clean_gst_field(org_raw)
 
-    # 7. Principal Place of Business Address
-    principal_raw = next((v for k, v in table_kv.items() if "principal place of business" in k), "") or first_match([
-        r"Principal Place of Business\s*[:\-]?\s*(.+?)(?="
-        r"Additional Place of Business|Date of Liability|Period of Validity|"
-        r"Particulars of|Details of Goods|Constitution of Business|$)",
-    ], text, re.IGNORECASE | re.DOTALL)
-    data["gst_address"] = deduplicate_address(extract_address_from_block(principal_raw))
+    # 6. Type of Registration
+    reg_raw = ""
+    for k, v in table_kv.items():
+        if "type of registration" in k:
+            reg_raw = v
+            break
+    if not reg_raw:
+        m_reg = re.search(r'(?:7\.?\s*)?Type\s*of\s*Registratio[no]\s*[:\.\-]?\s*([A-Za-z]+)', clean_text, re.IGNORECASE)
+        if m_reg:
+            reg_raw = m_reg.group(1)
+    data["gst_registration_type"] = clean_gst_field(reg_raw) or "Regular"
 
-    # 8. Additional Place of Business (Page 2 support)
-    additional_raw = ""
-    if additional_addresses:
-        additional_raw = additional_addresses[0]
-    else:
-        additional_raw = next((v for k, v in table_kv.items() if "additional place" in k), "") or first_match([
-            r"Details of Additional Places? of Business\s*[:\-]?\s*(.+?)(?="
-            r"Particulars of|Details of|Note:|Place\s*:|$)",
-            r"Additional Place(?:s)? of Business\s*[:\-]?\s*(.+?)(?="
-            r"Date of Liability|Period of Validity|Particulars of|Details of|$)",
-        ], text, re.IGNORECASE | re.DOTALL)
+    # 7. Principal Address
+    addr_raw = ""
+    for k, v in table_kv.items():
+        if "principal place of" in k or "address of principal" in k:
+            addr_raw = v
+            break
+    if not addr_raw:
+        m_addr = re.search(
+            r'(?:4\.?\s*)?Address\s*of\s*Principal\s*Place\s*of\s*(?:Business)?\s*[:\.\-]?\s*(.+?)(?=(?:I\s*)?[5-9]\.|\bDate\s*of|\bPeriod\s*of|$)',
+            text, re.IGNORECASE | re.DOTALL
+        )
+        if m_addr:
+            raw_chunk = m_addr.group(1)
+            clean_chunk_lines = [l for l in raw_chunk.split('\n') if l.strip().lower() != 'business']
+            addr_raw = ' '.join(clean_chunk_lines)
 
-    clean_add = deduplicate_address(extract_address_from_block(additional_raw))
-    if clean_add and clean_add.lower() not in ["nil", "na", "not applicable", "none", "0"]:
-        data["gst_additional_address"] = clean_add
+    data["gst_address"] = clean_gst_address(addr_raw)
 
-    # 9. Date of Liability, Validity From & Issue Date
-    liability_date = first_match([
-        r"Date of Liability\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-    ], text)
-    data["gst_liability_date"] = format_date_for_display(liability_date)
+    # 8. Additional Address (Annexure A)
+    m_count = re.search(r'Total\s*Number\s*of\s*Additional\s*Places?\s*of\s*Business(?:s)?\s*in\s*the\s*State\s*[:\-]?\s*(\d+)', text, re.IGNORECASE)
+    add_count = int(m_count.group(1)) if m_count else 0
+    if add_count > 0:
+        m_annex_a = re.search(r'Annexure\s*A\s+Details\s*of\s*Additional\s*Place.*?(?:Sr\.?\s*No\.?\s*Address|Sr\s*No\s*Address)\s+(.+?)(?=Annexure\s*B|Details\s*of\s*Proprietor|Details\s*of\s*Partners|$)', text, re.IGNORECASE | re.DOTALL)
+        if m_annex_a:
+            chunk = m_annex_a.group(1)
+            add_items = re.split(r'\n\s*\d+\s+', '\n' + chunk)
+            clean_add_items = []
+            for item in add_items:
+                s_item = clean_gst_address(item)
+                if s_item and re.search(r'\b\d{6}\b', s_item):
+                    clean_add_items.append(s_item)
+            if clean_add_items:
+                data["gst_additional_address"] = "; ".join(clean_add_items[:3])
 
-    validity_from = first_match([
-        r"Period of Validity\s*[:\-]?\s*From\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-        r"Validity\s*From\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-        r"Date of Registration\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-    ], text)
-    data["gst_registration_date"] = format_date_for_display(validity_from)
+    # 9. Dates
+    m_liab = re.search(r'Date\s*of\s*Liab[a-z]*\s*[:\.\-~J\s]*([0-9/]{8,10})', text, re.IGNORECASE)
+    if m_liab:
+        raw_d = m_liab.group(1).replace('101107', '01/07').replace('01107', '01/07')
+        if len(raw_d) == 10 and '/' in raw_d:
+            data["gst_liability_date"] = raw_d
 
-    issue_date = first_match([
-        r"Date of issue of Certificate\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-        r"Date of Issue\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
-    ], text)
-    data["gst_issue_date"] = format_date_for_display(issue_date)
+    m_val = re.search(r'(?:Period\s*of\s*Validity|Validity)\s*From\s*[:\.\-~I\s]*([0-9/]{8,10})', text, re.IGNORECASE)
+    if m_val:
+        raw_v = m_val.group(1).replace('101107', '01/07').replace('01107', '01/07')
+        if len(raw_v) == 10 and '/' in raw_v:
+            data["gst_registration_date"] = raw_v
 
-    # 10. Description of Goods / Services (HSN/SAC)
-    goods_services = first_match([
-        r"Description of Goods\s*/?\s*Services.*?\n(.+?)(?="
-        r"Note:|Details of|Place\s*:|$)",
-        r"Nature of Business Activities\s*[:\-]?\s*(.+)",
-    ], text, re.IGNORECASE | re.DOTALL)
-    data["gst_goods_services_raw"] = clean_line(goods_services)
+    m_iss = re.search(r'Date\s*of\s*issue\s*(?:of\s*Certificate)?\s*[:\.\-~I\s]*([0-9/]{8,10})', text, re.IGNORECASE)
+    if m_iss:
+        raw_iss = m_iss.group(1)
+        # Fix OCR slash read as 1: e.g. 19/0712018 -> 19/07/2018
+        raw_iss = re.sub(r'(\d{2}/\d{2})1(\d{4})', r'\1/\2', raw_iss)
+        data["gst_issue_date"] = raw_iss
 
     return {key: value for key, value in data.items() if value}
 

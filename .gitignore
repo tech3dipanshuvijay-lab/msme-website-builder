@@ -1,5 +1,6 @@
 # Confidential / Client certificates & documents
 udyam/
+gst/
 *.pdf
 
 # Local SQLite databases
